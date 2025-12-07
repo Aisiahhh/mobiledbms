@@ -23,19 +23,15 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// multer tmp storage (disk). Ensure tmp/ exists or multer will create temp files.
 const upload = multer({ dest: 'tmp/' });
 
-// Helper: upload a local file (multer) to supabase storage. Returns storage path.
 async function uploadFileToStorage(multerFile, destPath) {
   const fileStream = fs.createReadStream(multerFile.path);
-  // upload accepts Buffer or ReadableStream
   const { data, error } = await supa.storage.from(BUCKET).upload(destPath, fileStream, { upsert: false });
   if (error) throw error;
   return data?.path || destPath;
 }
 
-// Helper: create signed URL for a storage path
 async function createSignedUrlForPath(storagePath) {
   const { data, error } = await supa.storage.from(BUCKET).createSignedUrl(storagePath, SIGNED_URL_EXPIRES);
   if (error) {
@@ -45,8 +41,8 @@ async function createSignedUrlForPath(storagePath) {
   return data?.signedURL ?? null;
 }
 
-// POST /upload
-app.post('/upload', upload.any(), async (req, res) => {
+//pagupload ning files for resumption
+app.post('/resumption', upload.any(), async (req, res) => {
   try {
     const {
       type: uploadType,
@@ -56,7 +52,6 @@ app.post('/upload', upload.any(), async (req, res) => {
       supporting_files_metadata
     } = req.body;
 
-    // Insert upload row
     const { data: uploadRow, error: uploadError } = await supa
       .from('uploads')
       .insert({
@@ -73,10 +68,8 @@ app.post('/upload', upload.any(), async (req, res) => {
 
     const files = req.files || [];
 
-    // Collect response info
-    const uploadedFilesInfo = []; // { filename, storage_path, signedUrl, doc_type, label, upload_row_id }
+    const uploadedFilesInfo = [];
 
-    // Handle known required fields
     const requiredFields = [
       { field: 'required_letter_request', doc_type: 'required', label: 'Letter Request of the Contractor for Contract Time Resumption' },
       { field: 'required_approved_suspension', doc_type: 'required', label: 'Approved Suspension Order' },
@@ -89,8 +82,6 @@ app.post('/upload', upload.any(), async (req, res) => {
         const dest = `uploads/${uploadId}/${rf.field}/${path.basename(mf.originalname)}`;
         const storagePath = await uploadFileToStorage(mf, dest);
         const signedUrl = await createSignedUrlForPath(storagePath);
-
-        // insert meta row
         await supa.from('supporting_files').insert({
           upload_id: uploadId,
           doc_type: rf.doc_type,
@@ -110,19 +101,14 @@ app.post('/upload', upload.any(), async (req, res) => {
       }
     }
 
-    // Parse supporting_files_metadata JSON (client should send mapping)
     let supportMeta = [];
     if (supporting_files_metadata) {
       try {
         supportMeta = JSON.parse(supporting_files_metadata);
       } catch (err) {
         console.warn('Invalid supporting_files_metadata JSON:', err);
-        // don't throw — continue but warn
       }
     }
-
-    // supportMeta expected format:
-    // [ { type: 'A', title: '...', items: [ { label, filename, station, caption, lat, lon }, ... ] }, ... ]
 
     for (const supType of supportMeta) {
       const type = supType.type;
@@ -130,7 +116,6 @@ app.post('/upload', upload.any(), async (req, res) => {
       const items = supType.items || [];
 
       for (const it of items) {
-        // find multer file whose originalname matches it.filename
         const mf = files.find(f => f.originalname === it.filename);
         if (!mf) {
           console.warn('No uploaded file found for filename', it.filename);
@@ -141,7 +126,6 @@ app.post('/upload', upload.any(), async (req, res) => {
         const storagePath = await uploadFileToStorage(mf, dest);
         const signedUrl = await createSignedUrlForPath(storagePath);
 
-        // insert DB row
         await supa.from('supporting_files').insert({
           upload_id: uploadId,
           doc_type: type,
@@ -169,7 +153,6 @@ app.post('/upload', upload.any(), async (req, res) => {
       }
     }
 
-    // cleanup tmp files
     for (const f of files) {
       try { fs.unlinkSync(f.path); } catch (e) {}
     }
@@ -177,6 +160,206 @@ app.post('/upload', upload.any(), async (req, res) => {
     return res.json({ ok: true, uploadId, files: uploadedFilesInfo });
   } catch (err) {
     console.error('Upload error:', err);
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// Get list of all uploads
+app.get('/resumption/list', async (req, res) => {
+  try {
+    const { page = 1, limit = 20, type = 'resumption' } = req.query;
+    const offset = (page - 1) * limit;
+
+    let query = supa
+      .from('uploads')
+      .select('*', { count: 'exact' })
+      .order('created_at', { ascending: false });
+
+    if (type) {
+      query = query.ilike('upload_type', `%${type}%`);
+    }
+
+    query = query.range(offset, offset + parseInt(limit) - 1);
+
+    const { data, error, count } = await query;
+
+    if (error) throw error;
+
+    return res.json({ 
+      ok: true, 
+      uploads: data, 
+      total: count,
+      page: parseInt(page),
+      limit: parseInt(limit)
+    });
+  } catch (err) {
+    console.error('List error:', err);
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// Get single upload with all files
+app.get('/resumption/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Get upload details
+    const { data: uploadData, error: uploadError } = await supa
+      .from('uploads')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (uploadError) throw uploadError;
+
+    // Get all supporting files for this upload
+    const { data: filesData, error: filesError } = await supa
+      .from('supporting_files')
+      .select('*')
+      .eq('upload_id', id)
+      .order('doc_type', { ascending: true });
+
+    if (filesError) throw filesError;
+
+    // Generate signed URLs for all files
+    const filesWithUrls = await Promise.all(
+      filesData.map(async (file) => {
+        const signedUrl = await createSignedUrlForPath(file.storage_path);
+        return { ...file, signedUrl };
+      })
+    );
+
+    return res.json({ 
+      ok: true, 
+      upload: uploadData, 
+      files: filesWithUrls 
+    });
+  } catch (err) {
+    console.error('Detail error:', err);
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// Add these endpoints to your existing index.js
+
+// Get list of all uploads (add this after your existing POST endpoint)
+app.get('/resumption/list', async (req, res) => {
+  try {
+    const { page = 1, limit = 20, type = 'resumption' } = req.query;
+    const offset = (page - 1) * limit;
+
+    let query = supa
+      .from('uploads')
+      .select('*', { count: 'exact' })
+      .order('created_at', { ascending: false });
+
+    if (type) {
+      query = query.ilike('upload_type', `%${type}%`);
+    }
+
+    query = query.range(offset, offset + parseInt(limit) - 1);
+
+    const { data, error, count } = await query;
+
+    if (error) throw error;
+
+    return res.json({ 
+      ok: true, 
+      uploads: data, 
+      total: count,
+      page: parseInt(page),
+      limit: parseInt(limit)
+    });
+  } catch (err) {
+    console.error('List error:', err);
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// Get single upload with all files (add this)
+app.get('/resumption/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Get upload details
+    const { data: uploadData, error: uploadError } = await supa
+      .from('uploads')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (uploadError) throw uploadError;
+
+    // Get all supporting files for this upload
+    const { data: filesData, error: filesError } = await supa
+      .from('supporting_files')
+      .select('*')
+      .eq('upload_id', id)
+      .order('doc_type', { ascending: true });
+
+    if (filesError) throw filesError;
+
+    // Generate signed URLs for all files
+    const filesWithUrls = await Promise.all(
+      filesData.map(async (file) => {
+        const signedUrl = await createSignedUrlForPath(file.storage_path);
+        return { ...file, signedUrl };
+      })
+    );
+
+    return res.json({ 
+      ok: true, 
+      upload: uploadData, 
+      files: filesWithUrls 
+    });
+  } catch (err) {
+    console.error('Detail error:', err);
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// Delete an upload (optional - add this if you want delete functionality)
+app.delete('/resumption/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // First get all files to delete from storage
+    const { data: files, error: fetchError } = await supa
+      .from('supporting_files')
+      .select('storage_path')
+      .eq('upload_id', id);
+
+    if (fetchError) throw fetchError;
+
+    // Delete files from storage
+    const storagePaths = files.map(f => f.storage_path);
+    if (storagePaths.length > 0) {
+      const { error: storageError } = await supa.storage
+        .from(BUCKET)
+        .remove(storagePaths);
+      
+      if (storageError) throw storageError;
+    }
+
+    // Delete supporting files records
+    const { error: filesError } = await supa
+      .from('supporting_files')
+      .delete()
+      .eq('upload_id', id);
+
+    if (filesError) throw filesError;
+
+    // Delete the upload record
+    const { error: uploadError } = await supa
+      .from('uploads')
+      .delete()
+      .eq('id', id);
+
+    if (uploadError) throw uploadError;
+
+    return res.json({ ok: true, message: 'Upload deleted successfully' });
+  } catch (err) {
+    console.error('Delete error:', err);
     return res.status(500).json({ ok: false, error: String(err) });
   }
 });

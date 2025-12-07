@@ -1,11 +1,15 @@
 // lib/pert_upload_page.dart
 import 'dart:convert';
-import 'dart:io' show File;
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
+
+// conditional import: uses real File helper on platforms that support dart:io,
+// and a stub on web so the app can compile for web.
+import 'utils/io_file_stub.dart'
+    if (dart.library.io) 'utils/io_file_io.dart' as io_file;
 
 class PertUploadPage extends StatefulWidget {
   final PertMode? initialMode;
@@ -29,8 +33,9 @@ class _PertUploadPageState extends State<PertUploadPage> {
   PertMode _mode = PertMode.original;
   bool _uploading = false;
 
-  // server URL - change to match your Node server reachable by the device/emulator
-  final String _uploadUrl = kIsWeb ? 'http://localhost:3000/upload' : 'http://10.0.2.2:3000/upload';
+  // IMPORTANT: on a physical device replace 10.0.2.2 with your machine IP e.g.
+  // 'http://192.168.1.100:3000/pert' so the device can reach your server.
+  final String _uploadUrl = kIsWeb ? 'http://localhost:3000/pert' : 'http://10.0.2.2:3000/pert';
 
   // PlatformFile references for each required doc (original)
   PlatformFile? _noticeOfAward;
@@ -47,7 +52,18 @@ class _PertUploadPageState extends State<PertUploadPage> {
   PlatformFile? _latestPdmOrBarChart;
 
   static const int maxFileBytes = 25 * 1024 * 1024; // 25MB
-  static const List<String> allowedExt = ['pdf','jpg','jpeg','png','xlsx','xls','doc','docx','zip'];
+  static const List<String> allowedExt = [
+    'pdf',
+    'jpg',
+    'jpeg',
+    'png',
+    'xlsx',
+    'xls',
+    'doc',
+    'docx',
+    'zip',
+    'heic'
+  ];
 
   @override
   void initState() {
@@ -72,12 +88,15 @@ class _PertUploadPageState extends State<PertUploadPage> {
   }
 
   Future<void> _addPlatformFileToRequest(http.MultipartRequest req, String fieldName, PlatformFile pf) async {
+    // web path: use bytes
     if (kIsWeb) {
       final bytes = pf.bytes;
       if (bytes == null) throw Exception('File bytes missing for web: ${pf.name}');
       req.files.add(http.MultipartFile.fromBytes(fieldName, bytes, filename: pf.name));
     } else {
-      final file = File(pf.path!);
+      // native path: use File stream via conditional helper
+      if (pf.path == null) throw Exception('PlatformFile.path is null for: ${pf.name}');
+      final file = io_file.fileFromPath(pf.path!); // resolved to real File on native platforms
       final stream = http.ByteStream(file.openRead());
       final length = await file.length();
       req.files.add(http.MultipartFile(fieldName, stream, length, filename: p.basename(file.path)));
@@ -109,7 +128,9 @@ class _PertUploadPageState extends State<PertUploadPage> {
       return;
     }
 
-    setState(() { _uploading = true; });
+    setState(() {
+      _uploading = true;
+    });
 
     try {
       final uri = Uri.parse(_uploadUrl);
@@ -164,10 +185,10 @@ class _PertUploadPageState extends State<PertUploadPage> {
 
       final streamed = await request.send();
       final response = await http.Response.fromStream(streamed);
+
       if (response.statusCode >= 200 && response.statusCode < 300) {
         if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('PERT files uploaded successfully')));
-        if (!mounted) return;
         setState(() {
           _contractorController.clear();
           _projectController.clear();
@@ -188,15 +209,24 @@ class _PertUploadPageState extends State<PertUploadPage> {
           _latestPdmOrBarChart = null;
         });
       } else {
+        // show server error message if present (helps debugging)
+        String body = response.body;
+        String msg = 'Upload failed: ${response.statusCode}';
+        try {
+          final decoded = jsonDecode(body);
+          if (decoded is Map && decoded['error'] != null) msg += ' — ${decoded['error']}';
+        } catch (_) {}
         if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Upload failed: ${response.statusCode} — ${response.body}')));
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
       }
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Upload error: $e')));
     } finally {
       if (!mounted) return;
-      setState(() { _uploading = false; });
+      setState(() {
+        _uploading = false;
+      });
     }
   }
 
@@ -207,22 +237,30 @@ class _PertUploadPageState extends State<PertUploadPage> {
         _fileRow('Notice of Award', _noticeOfAward, () async {
           final f = await _pickSingle();
           if (f == null) return;
-          setState(() { _noticeOfAward = f; });
+          setState(() {
+            _noticeOfAward = f;
+          });
         }),
         _fileRow('Breakdown of Contract Cost', _breakdownOfContractCost, () async {
           final f = await _pickSingle();
           if (f == null) return;
-          setState(() { _breakdownOfContractCost = f; });
+          setState(() {
+            _breakdownOfContractCost = f;
+          });
         }),
         _fileRow('Construction Methods', _constructionMethods, () async {
           final f = await _pickSingle();
           if (f == null) return;
-          setState(() { _constructionMethods = f; });
+          setState(() {
+            _constructionMethods = f;
+          });
         }),
         _fileRow('Monthly Manpower and Equipment Utilization Schedule', _monthlyManpowerSchedule, () async {
           final f = await _pickSingle();
           if (f == null) return;
-          setState(() { _monthlyManpowerSchedule = f; });
+          setState(() {
+            _monthlyManpowerSchedule = f;
+          });
         }),
       ],
     );
@@ -235,32 +273,44 @@ class _PertUploadPageState extends State<PertUploadPage> {
         _fileRow('Previously approved Construction Schedule + Manpower Schedule', _prevApprovedSchedule, () async {
           final f = await _pickSingle();
           if (f == null) return;
-          setState(() { _prevApprovedSchedule = f; });
+          setState(() {
+            _prevApprovedSchedule = f;
+          });
         }),
         _fileRow('Approved Original Contract', _approvedOriginalContract, () async {
           final f = await _pickSingle();
           if (f == null) return;
-          setState(() { _approvedOriginalContract = f; });
+          setState(() {
+            _approvedOriginalContract = f;
+          });
         }),
         _fileRow('Notice to Proceed', _noticeToProceed, () async {
           final f = await _pickSingle();
           if (f == null) return;
-          setState(() { _noticeToProceed = f; });
+          setState(() {
+            _noticeToProceed = f;
+          });
         }),
         _fileRow('Approved Variation Orders', _approvedVariationOrders, () async {
           final f = await _pickSingle();
           if (f == null) return;
-          setState(() { _approvedVariationOrders = f; });
+          setState(() {
+            _approvedVariationOrders = f;
+          });
         }),
         _fileRow('Approved Time Extensions (if any)', _approvedTimeExtensions, () async {
           final f = await _pickSingle();
           if (f == null) return;
-          setState(() { _approvedTimeExtensions = f; });
+          setState(() {
+            _approvedTimeExtensions = f;
+          });
         }),
         _fileRow('Latest PDM / Bar Chart with S-Curve', _latestPdmOrBarChart, () async {
           final f = await _pickSingle();
           if (f == null) return;
-          setState(() { _latestPdmOrBarChart = f; });
+          setState(() {
+            _latestPdmOrBarChart = f;
+          });
         }),
       ],
     );
@@ -279,25 +329,35 @@ class _PertUploadPageState extends State<PertUploadPage> {
               setState(() {
                 switch (label) {
                   case 'Notice of Award':
-                    _noticeOfAward = null; break;
+                    _noticeOfAward = null;
+                    break;
                   case 'Breakdown of Contract Cost':
-                    _breakdownOfContractCost = null; break;
+                    _breakdownOfContractCost = null;
+                    break;
                   case 'Construction Methods':
-                    _constructionMethods = null; break;
+                    _constructionMethods = null;
+                    break;
                   case 'Monthly Manpower and Equipment Utilization Schedule':
-                    _monthlyManpowerSchedule = null; break;
+                    _monthlyManpowerSchedule = null;
+                    break;
                   case 'Previously approved Construction Schedule + Manpower Schedule':
-                    _prevApprovedSchedule = null; break;
+                    _prevApprovedSchedule = null;
+                    break;
                   case 'Approved Original Contract':
-                    _approvedOriginalContract = null; break;
+                    _approvedOriginalContract = null;
+                    break;
                   case 'Notice to Proceed':
-                    _noticeToProceed = null; break;
+                    _noticeToProceed = null;
+                    break;
                   case 'Approved Variation Orders':
-                    _approvedVariationOrders = null; break;
+                    _approvedVariationOrders = null;
+                    break;
                   case 'Approved Time Extensions (if any)':
-                    _approvedTimeExtensions = null; break;
+                    _approvedTimeExtensions = null;
+                    break;
                   case 'Latest PDM / Bar Chart with S-Curve':
-                    _latestPdmOrBarChart = null; break;
+                    _latestPdmOrBarChart = null;
+                    break;
                   default:
                     break;
                 }

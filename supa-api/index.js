@@ -364,6 +364,122 @@ app.delete('/resumption/:id', async (req, res) => {
   }
 });
 
+// POST /pert  -- handle PERT/CPM/PDM uploads
+app.post('/pert', upload.any(), async (req, res) => {
+  try {
+    // fields sent from Flutter
+    const {
+      type = 'PERT/CPM/PDM',
+      contractorName = null,
+      projectName = null,
+      certifierName = null,
+      certifierDesignation = null,
+      certificationDate = null,
+      pert_metadata = null // JSON string
+    } = req.body;
+
+    // Insert upload row into 'uploads' table (add certifier fields as extra columns if present)
+    const { data: uploadRow, error: uploadError } = await supa
+      .from('uploads')
+      .insert({
+        upload_type: type,
+        contractor_name: contractorName,
+        project_name: projectName,
+        notes: null,
+        certifier_name: certifierName,
+        certifier_designation: certifierDesignation,
+        certification_date: certificationDate ? certificationDate : null
+      })
+      .select('id')
+      .single();
+
+    if (uploadError) throw uploadError;
+    const uploadId = uploadRow.id;
+
+    const files = req.files || [];
+    const uploadedFilesInfo = [];
+
+    // parse metadata if provided (expected structure from Flutter: { mode: 'original'|'revised', items: [{ label, filename }, ... ] })
+    let meta = null;
+    try {
+      if (pert_metadata) meta = JSON.parse(pert_metadata);
+    } catch (e) {
+      console.warn('Invalid pert_metadata JSON:', e);
+      meta = null;
+    }
+
+    // helper to find metadata item by filename
+    const findMetaByFilename = (filename) => {
+      if (!meta || !Array.isArray(meta.items)) return null;
+      return meta.items.find(it => it.filename === filename || it.filename === encodeURIComponent(filename));
+    };
+
+    // process each uploaded file
+    for (const mf of files) {
+      // determine doc_type and label:
+      // prefer metadata match by originalname; else derive from fieldname prefix after 'pert_original_' or 'pert_revised_'
+      const originalName = mf.originalname;
+      const fieldName = mf.fieldname || '';
+      const metaItem = findMetaByFilename(originalName);
+
+      // doc_type: either 'PERT-ORIGINAL' or 'PERT-REVISED' derived from fieldName or meta.mode
+      let docType = 'PERT';
+      if (fieldName.startsWith('pert_original') || (meta && meta.mode === 'original')) docType = 'PERT_ORIGINAL';
+      if (fieldName.startsWith('pert_revised') || (meta && meta.mode === 'revised')) docType = 'PERT_REVISED';
+
+      // label/title: prefer metadata label, else derive a friendly label from fieldName, else use original filename
+      let label = metaItem?.label ?? null;
+      if (!label) {
+        // fieldName like 'pert_original_notice_of_award' -> 'Notice of award'
+        if (fieldName.startsWith('pert_')) {
+          const parts = fieldName.replace(/^pert_(original|revised)_?/, '').split('_').filter(Boolean);
+          if (parts.length > 0) {
+            label = parts.join(' ').replace(/\b\w/g, c => c.toUpperCase());
+          }
+        }
+      }
+      if (!label) label = originalName;
+
+      // upload to storage
+      const dest = `uploads/${uploadId}/pert/${path.basename(originalName)}`;
+      const storagePath = await uploadFileToStorage(mf, dest);
+      const signedUrl = await createSignedUrlForPath(storagePath);
+
+      // insert DB record for supporting_files
+      const { error: sfError } = await supa.from('supporting_files').insert({
+        upload_id: uploadId,
+        doc_type: docType,
+        doc_title: label,
+        label: label,
+        filename: originalName,
+        storage_path: storagePath,
+        station: null,
+        caption: null,
+        latitude: null,
+        longitude: null
+      });
+
+      if (sfError) throw sfError;
+
+      uploadedFilesInfo.push({
+        filename: originalName,
+        fieldName,
+        storage_path: storagePath,
+        signedUrl,
+        doc_type: docType,
+        label
+      });
+    }
+
+    // return success
+    return res.json({ ok: true, uploadId, files: uploadedFilesInfo });
+  } catch (err) {
+    console.error('PERT upload error:', err);
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server listening on ${PORT}`);

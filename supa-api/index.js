@@ -25,11 +25,23 @@ app.use(express.json());
 
 const upload = multer({ dest: 'tmp/' });
 
+// single helper to upload to storage (returns storage path)
 async function uploadFileToStorage(multerFile, destPath) {
-  const fileStream = fs.createReadStream(multerFile.path);
-  const { data, error } = await supa.storage.from(BUCKET).upload(destPath, fileStream, { upsert: false });
-  if (error) throw error;
-  return data?.path || destPath;
+  try {
+    const fileStream = fs.createReadStream(multerFile.path);
+    const { data, error } = await supa.storage.from(BUCKET).upload(destPath, fileStream, { upsert: false });
+    if (error) {
+      // throw error object so caller can inspect
+      const err = new Error('Supabase storage upload error');
+      err.details = error;
+      throw err;
+    }
+    return data?.path || destPath;
+  } catch (err) {
+    const e = new Error(`uploadFileToStorage failed for ${multerFile.originalname}: ${err.message || err}`);
+    e.inner = err;
+    throw e;
+  }
 }
 
 async function createSignedUrlForPath(storagePath) {
@@ -41,7 +53,10 @@ async function createSignedUrlForPath(storagePath) {
   return data?.signedURL ?? null;
 }
 
-//pagupload ning files for resumption
+/**
+ * Resumption POST (existing)
+ * (unchanged except minor cleanups)
+ */
 app.post('/resumption', upload.any(), async (req, res) => {
   try {
     const {
@@ -67,7 +82,6 @@ app.post('/resumption', upload.any(), async (req, res) => {
     const uploadId = uploadRow.id;
 
     const files = req.files || [];
-
     const uploadedFilesInfo = [];
 
     const requiredFields = [
@@ -164,7 +178,9 @@ app.post('/resumption', upload.any(), async (req, res) => {
   }
 });
 
-// Get list of all uploads
+/**
+ * GET list endpoint (unchanged)
+ */
 app.get('/resumption/list', async (req, res) => {
   try {
     const { page = 1, limit = 20, type = 'resumption' } = req.query;
@@ -198,7 +214,9 @@ app.get('/resumption/list', async (req, res) => {
   }
 });
 
-// Get single upload with all files
+/**
+ * GET detail endpoint (unchanged)
+ */
 app.get('/resumption/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -240,85 +258,9 @@ app.get('/resumption/:id', async (req, res) => {
   }
 });
 
-// Add these endpoints to your existing index.js
-
-// Get list of all uploads (add this after your existing POST endpoint)
-app.get('/resumption/list', async (req, res) => {
-  try {
-    const { page = 1, limit = 20, type = 'resumption' } = req.query;
-    const offset = (page - 1) * limit;
-
-    let query = supa
-      .from('uploads')
-      .select('*', { count: 'exact' })
-      .order('created_at', { ascending: false });
-
-    if (type) {
-      query = query.ilike('upload_type', `%${type}%`);
-    }
-
-    query = query.range(offset, offset + parseInt(limit) - 1);
-
-    const { data, error, count } = await query;
-
-    if (error) throw error;
-
-    return res.json({ 
-      ok: true, 
-      uploads: data, 
-      total: count,
-      page: parseInt(page),
-      limit: parseInt(limit)
-    });
-  } catch (err) {
-    console.error('List error:', err);
-    return res.status(500).json({ ok: false, error: String(err) });
-  }
-});
-
-// Get single upload with all files (add this)
-app.get('/resumption/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    // Get upload details
-    const { data: uploadData, error: uploadError } = await supa
-      .from('uploads')
-      .select('*')
-      .eq('id', id)
-      .single();
-
-    if (uploadError) throw uploadError;
-
-    // Get all supporting files for this upload
-    const { data: filesData, error: filesError } = await supa
-      .from('supporting_files')
-      .select('*')
-      .eq('upload_id', id)
-      .order('doc_type', { ascending: true });
-
-    if (filesError) throw filesError;
-
-    // Generate signed URLs for all files
-    const filesWithUrls = await Promise.all(
-      filesData.map(async (file) => {
-        const signedUrl = await createSignedUrlForPath(file.storage_path);
-        return { ...file, signedUrl };
-      })
-    );
-
-    return res.json({ 
-      ok: true, 
-      upload: uploadData, 
-      files: filesWithUrls 
-    });
-  } catch (err) {
-    console.error('Detail error:', err);
-    return res.status(500).json({ ok: false, error: String(err) });
-  }
-});
-
-// Delete an upload (optional - add this if you want delete functionality)
+/**
+ * Delete endpoint (unchanged)
+ */
 app.delete('/resumption/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -364,121 +306,328 @@ app.delete('/resumption/:id', async (req, res) => {
   }
 });
 
-// POST /pert  -- handle PERT/CPM/PDM uploads
+/**
+ * PERT upload endpoint (fixed)
+ * Accepts pert_metadata as either:
+ *  - an array of groups: [{ type: 'A', title:'..', items:[{filename:..., label:...}, ...] }, ...]
+ *  - OR a single object { mode: 'original', items: [{filename:..., label:...}, ...] }
+ */
 app.post('/pert', upload.any(), async (req, res) => {
   try {
-    // fields sent from Flutter
+    console.log('[PERT] route hit');
+    console.log('[PERT] body:', req.body);
+    console.log('[PERT] files count:', (req.files || []).length);
+
     const {
-      type = 'PERT/CPM/PDM',
-      contractorName = null,
-      projectName = null,
-      certifierName = null,
-      certifierDesignation = null,
-      certificationDate = null,
-      pert_metadata = null // JSON string
+      type: uploadType = '',
+      contractorName = '',
+      projectName = '',
+      certifierName = '',
+      certifierDesignation = '',
+      certificationDate = '',
+      pert_metadata = null
     } = req.body;
 
-    // Insert upload row into 'uploads' table (add certifier fields as extra columns if present)
+    // Basic validation
+    if (!contractorName || !projectName) {
+      return res.status(400).json({ ok: false, error: 'contractorName and projectName are required' });
+    }
+
+    // Insert upload row - do not include certification_date unless you really have that column
+    const insertPayload = {
+      upload_type: uploadType || 'PERT',
+      contractor_name: contractorName || null,
+      project_name: projectName || null,
+      notes: null,
+      certifier_name: certifierName || null,
+      certifier_designation: certifierDesignation || null
+    };
+
+    // Only add certification_date if it exists and is non-empty; safe if column missing, remove this line if you get PGRST errors
+    // If you still get PGRST204 (missing column), remove/comment the following conditional.
+    if (certificationDate && certificationDate.trim() !== '') {
+      insertPayload.certification_date = certificationDate;
+    }
+
     const { data: uploadRow, error: uploadError } = await supa
       .from('uploads')
-      .insert({
-        upload_type: type,
-        contractor_name: contractorName,
-        project_name: projectName,
-        notes: null,
-        certifier_name: certifierName,
-        certifier_designation: certifierDesignation,
-        certification_date: certificationDate ? certificationDate : null
-      })
+      .insert(insertPayload)
       .select('id')
       .single();
 
-    if (uploadError) throw uploadError;
-    const uploadId = uploadRow.id;
+    if (uploadError) {
+      console.error('[PERT] supa insert upload error', uploadError);
+      throw uploadError;
+    }
 
+    const uploadId = uploadRow.id;
     const files = req.files || [];
     const uploadedFilesInfo = [];
 
-    // parse metadata if provided (expected structure from Flutter: { mode: 'original'|'revised', items: [{ label, filename }, ... ] })
-    let meta = null;
+    // Parse pert_metadata defensively:
+    let parsedMeta = null;
     try {
-      if (pert_metadata) meta = JSON.parse(pert_metadata);
-    } catch (e) {
-      console.warn('Invalid pert_metadata JSON:', e);
-      meta = null;
+      parsedMeta = pert_metadata ? JSON.parse(pert_metadata) : null;
+    } catch (parseErr) {
+      console.warn('[PERT] pert_metadata parse error', parseErr);
+      parsedMeta = null;
     }
 
-    // helper to find metadata item by filename
-    const findMetaByFilename = (filename) => {
-      if (!meta || !Array.isArray(meta.items)) return null;
-      return meta.items.find(it => it.filename === filename || it.filename === encodeURIComponent(filename));
-    };
+    // Normalize into array of groups (metaGroups)
+    let metaGroups = [];
+    if (Array.isArray(parsedMeta)) {
+      metaGroups = parsedMeta;
+    } else if (parsedMeta && Array.isArray(parsedMeta.items)) {
+      // client sent single object with items array (your case)
+      metaGroups = [{ type: parsedMeta.mode || 'original', title: parsedMeta.title || null, items: parsedMeta.items }];
+    } else {
+      metaGroups = [];
+    }
 
-    // process each uploaded file
-    for (const mf of files) {
-      // determine doc_type and label:
-      // prefer metadata match by originalname; else derive from fieldname prefix after 'pert_original_' or 'pert_revised_'
-      const originalName = mf.originalname;
-      const fieldName = mf.fieldname || '';
-      const metaItem = findMetaByFilename(originalName);
-
-      // doc_type: either 'PERT-ORIGINAL' or 'PERT-REVISED' derived from fieldName or meta.mode
-      let docType = 'PERT';
-      if (fieldName.startsWith('pert_original') || (meta && meta.mode === 'original')) docType = 'PERT_ORIGINAL';
-      if (fieldName.startsWith('pert_revised') || (meta && meta.mode === 'revised')) docType = 'PERT_REVISED';
-
-      // label/title: prefer metadata label, else derive a friendly label from fieldName, else use original filename
-      let label = metaItem?.label ?? null;
-      if (!label) {
-        // fieldName like 'pert_original_notice_of_award' -> 'Notice of award'
-        if (fieldName.startsWith('pert_')) {
-          const parts = fieldName.replace(/^pert_(original|revised)_?/, '').split('_').filter(Boolean);
-          if (parts.length > 0) {
-            label = parts.join(' ').replace(/\b\w/g, c => c.toUpperCase());
-          }
-        }
+    // Build map filename -> metadata (for quick lookup). If multiple items share same filename,
+    // latest will win (you can adjust logic if you want to allow duplicates)
+    const metaByFilename = {};
+    for (const g of metaGroups) {
+      const gtype = g.type || null;
+      const gtitle = g.title || null;
+      if (!Array.isArray(g.items)) continue;
+      for (const it of g.items) {
+        if (!it || !it.filename) continue;
+        metaByFilename[it.filename] = {
+          type: gtype,
+          title: gtitle,
+          label: it.label || null,
+          station: it.station || null,
+          caption: it.caption || null,
+          lat: it.lat ?? null,
+          lon: it.lon ?? null
+        };
       }
-      if (!label) label = originalName;
-
-      // upload to storage
-      const dest = `uploads/${uploadId}/pert/${path.basename(originalName)}`;
-      const storagePath = await uploadFileToStorage(mf, dest);
-      const signedUrl = await createSignedUrlForPath(storagePath);
-
-      // insert DB record for supporting_files
-      const { error: sfError } = await supa.from('supporting_files').insert({
-        upload_id: uploadId,
-        doc_type: docType,
-        doc_title: label,
-        label: label,
-        filename: originalName,
-        storage_path: storagePath,
-        station: null,
-        caption: null,
-        latitude: null,
-        longitude: null
-      });
-
-      if (sfError) throw sfError;
-
-      uploadedFilesInfo.push({
-        filename: originalName,
-        fieldName,
-        storage_path: storagePath,
-        signedUrl,
-        doc_type: docType,
-        label
-      });
     }
 
-    // return success
+    // Upload files
+    for (const f of files) {
+      try {
+        const safeName = path.basename(f.originalname);
+        const dest = `pert/${uploadId}/${f.fieldname || 'files'}/${Date.now()}_${safeName}`;
+
+        const storagePath = await uploadFileToStorage(f, dest);
+        const signedUrl = await createSignedUrlForPath(storagePath);
+
+        const metaItem = metaByFilename[f.originalname] || null;
+
+        const insertPayload = {
+          upload_id: uploadId,
+          doc_type: metaItem?.type || f.fieldname || null,
+          doc_title: metaItem?.title || null,
+          label: metaItem?.label || null,
+          filename: f.originalname,
+          storage_path: storagePath,
+          station: metaItem?.station || null,
+          caption: metaItem?.caption || null,
+          latitude: metaItem?.lat ?? null,
+          longitude: metaItem?.lon ?? null
+        };
+
+        const { error: sfError } = await supa.from('supporting_files').insert(insertPayload);
+        if (sfError) {
+          console.error('[PERT] insert supporting_files error', sfError);
+          throw sfError;
+        }
+
+        uploadedFilesInfo.push({
+          filename: f.originalname,
+          fieldname: f.fieldname,
+          storage_path: storagePath,
+          signedUrl,
+          meta: metaItem
+        });
+      } catch (fileErr) {
+        console.error('[PERT] error uploading single file', f.originalname, fileErr);
+        uploadedFilesInfo.push({ filename: f.originalname, error: String(fileErr) });
+      }
+    }
+
+    // cleanup tmp
+    for (const f of files) {
+      try {
+        fs.unlinkSync(f.path);
+      } catch (e) { /* ignore */ }
+    }
+
     return res.json({ ok: true, uploadId, files: uploadedFilesInfo });
   } catch (err) {
-    console.error('PERT upload error:', err);
+    console.error('[PERT] unexpected error:', err);
+    const message = err && err.message ? err.message : String(err);
+    const details = err && err.details ? err.details : null;
+    return res.status(500).json({ ok: false, error: message, details });
+  }
+});
+
+app.get('/pert/list', async (req, res) => {
+  try {
+    const { page = 1, limit = 20, search = '' } = req.query;
+    const offset = (page - 1) * limit;
+
+    // Start building the query
+    let query = supa
+      .from('uploads')
+      .select('*', { count: 'exact' })
+      .order('created_at', { ascending: false });
+
+    // Filter for PERT submissions - check for any upload_type containing PERT
+    query = query.or('upload_type.ilike.%PERT%,upload_type.ilike.%CPM%,upload_type.ilike.%PDM%');
+
+    // Optional search
+    if (search) {
+      query = query.or(`contractor_name.ilike.%${search}%,project_name.ilike.%${search}%`);
+    }
+
+    query = query.range(offset, offset + parseInt(limit) - 1);
+
+    const { data, error, count } = await query;
+
+    if (error) throw error;
+
+    // Also get file counts for each upload
+    const uploadsWithFileCounts = await Promise.all(
+      data.map(async (upload) => {
+        const { count: fileCount } = await supa
+          .from('supporting_files')
+          .select('*', { count: 'exact', head: true })
+          .eq('upload_id', upload.id);
+
+        return {
+          ...upload,
+          file_count: fileCount || 0
+        };
+      })
+    );
+
+    return res.json({ 
+      ok: true, 
+      uploads: uploadsWithFileCounts, 
+      total: count,
+      page: parseInt(page),
+      limit: parseInt(limit)
+    });
+  } catch (err) {
+    console.error('[PERT List] error:', err);
     return res.status(500).json({ ok: false, error: String(err) });
   }
 });
 
+/**
+ * GET single PERT submission with details
+ */
+app.get('/pert/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Get upload details
+    const { data: uploadData, error: uploadError } = await supa
+      .from('uploads')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (uploadError) throw uploadError;
+
+    // Get all supporting files for this upload, specifically for PERT
+    const { data: filesData, error: filesError } = await supa
+      .from('supporting_files')
+      .select('*')
+      .eq('upload_id', id)
+      .order('created_at', { ascending: true });
+
+    if (filesError) throw filesError;
+
+    // Generate signed URLs for all files
+    const filesWithUrls = await Promise.all(
+      filesData.map(async (file) => {
+        const signedUrl = await createSignedUrlForPath(file.storage_path);
+        return { ...file, signedUrl };
+      })
+    );
+
+    // Determine if this is original or revised based on upload_type or metadata
+    const isRevised = uploadData.upload_type && uploadData.upload_type.toLowerCase().includes('revised');
+    const mode = isRevised ? 'revised' : 'original';
+
+    // Group files by type or fieldname
+    const groupedFiles = {};
+    filesWithUrls.forEach(file => {
+      const type = file.doc_type || file.fieldname || 'other';
+      if (!groupedFiles[type]) {
+        groupedFiles[type] = [];
+      }
+      groupedFiles[type].push(file);
+    });
+
+    return res.json({ 
+      ok: true, 
+      upload: uploadData, 
+      files: filesWithUrls,
+      groupedFiles,
+      mode,
+      fileCount: filesWithUrls.length
+    });
+  } catch (err) {
+    console.error('[PERT Detail] error:', err);
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+/**
+ * DELETE PERT submission
+ */
+app.delete('/pert/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // First get all files to delete from storage
+    const { data: files, error: fetchError } = await supa
+      .from('supporting_files')
+      .select('storage_path')
+      .eq('upload_id', id);
+
+    if (fetchError) throw fetchError;
+
+    // Delete files from storage
+    const storagePaths = files.map(f => f.storage_path);
+    if (storagePaths.length > 0) {
+      const { error: storageError } = await supa.storage
+        .from(BUCKET)
+        .remove(storagePaths);
+      
+      if (storageError) {
+        console.warn('Failed to delete some files from storage:', storageError);
+        // Continue anyway
+      }
+    }
+
+    // Delete supporting files records
+    const { error: filesError } = await supa
+      .from('supporting_files')
+      .delete()
+      .eq('upload_id', id);
+
+    if (filesError) throw filesError;
+
+    // Delete the upload record
+    const { error: uploadError } = await supa
+      .from('uploads')
+      .delete()
+      .eq('id', id);
+
+    if (uploadError) throw uploadError;
+
+    return res.json({ ok: true, message: 'PERT submission deleted successfully' });
+  } catch (err) {
+    console.error('[PERT Delete] error:', err);
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {

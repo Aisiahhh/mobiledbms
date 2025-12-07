@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
-import 'package:mobile_dbms/pert_upload_page.dart';    // keep if you have this
+import 'package:mobile_dbms/pert_pdm/pert_list_page.dart';
+import 'package:mobile_dbms/pert_pdm/pert_upload_page.dart';    // keep if you have this
 import 'package:mobile_dbms/time_variance/resumption/resumption.dart';
 import 'package:mobile_dbms/time_variance/resumption/resumption_list_page.dart';
 import 'package:mobile_dbms/variation_order.dart';    // keep if you have this
@@ -74,44 +75,68 @@ class HomePage extends StatelessWidget {
     }
   }
 
-  Future<void> _openPertPdm(BuildContext context) async {
-    final choice = await showDialog<String>(
-      context: context,
-      builder: (ctx) {
-        return SimpleDialog(
-          title: const Text('Select PERT / PDM version'),
-          children: _pertSub
-              .map((s) => SimpleDialogOption(
-                    onPressed: () => Navigator.pop(ctx, s),
-                    child: Text(s),
-                  ))
-              .toList(),
-        );
-      },
-    );
+Future<void> _openPertPdm(BuildContext context) async {
+  // Go directly to the list page
+  Navigator.push(
+    context,
+    MaterialPageRoute(
+      builder: (_) => PertListPage(
+        serverUrl: kIsWeb ? 'http://localhost:3000' : 'http://10.0.2.2:3000',
+        initialLimit: 20,
+      ),
+    ),
+  );
+  
+  // Or if you want to keep the dialog for quick upload:
+  /*
+  final choice = await showDialog<String>(
+    context: context,
+    builder: (ctx) {
+      return SimpleDialog(
+        title: const Text('PERT / PDM'),
+        children: [
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, 'list'),
+            child: const Text('View Submissions'),
+          ),
+          const Divider(),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, 'original'),
+            child: const Text('Upload Original'),
+          ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, 'revised'),
+            child: const Text('Upload Revised'),
+          ),
+        ],
+      );
+    },
+  );
 
-    if (choice != null) {
-      // If your PertUploadPage supports an initial mode, pass it. Otherwise call without params.
-      try {
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (_) => PertUploadPage(
-              initialMode: choice == 'Original' ? PertMode.original : PertMode.revised,
-            ),
+  if (choice != null) {
+    if (choice == 'list') {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => PertListPage(
+            serverUrl: kIsWeb ? 'http://localhost:3000' : 'http://10.0.2.2:3000',
+            initialLimit: 20,
           ),
-        );
-      } catch (_) {
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (_) => PertUploadPage(),
+        ),
+      );
+    } else {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => PertUploadPage(
+            initialMode: choice == 'original' ? PertMode.original : PertMode.revised,
           ),
-        );
-      }
+        ),
+      );
     }
   }
-
+  */
+}
   void _onOptionTap(BuildContext context, _Option option) {
     final key = option.title.trim().toLowerCase();
     if (key == 'time variance') {
